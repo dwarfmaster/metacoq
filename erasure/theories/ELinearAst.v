@@ -4,6 +4,8 @@ From MetaRocq.Erasure Require EAst.
 From MetaRocq.Utils Require Import utils.
 From MetaRocq.Common Require Import BasicAst Universes.
 From MetaRocq.Erasure Require Import EPrimitive.
+From MetaRocq.Common Require Import Primitive.
+From Equations Require Import Equations.
 
 Declare Scope erasure.
 Local Open Scope erasure.
@@ -154,7 +156,7 @@ with is_unused_in : nat -> term -> Prop :=
 
 (* Evar might use the variable, so we forbid evars under linear binders *)
 (* Lambda must not capture array variables, because we do not support marking lambda as linear *)
-(* We don't assume an order of evaluation for application of function to argument, so the linearity check allows usage on one side only is it isn't read anywhere *)
+(* We assume f a b c are evaluated left to right, and that the arguments are fully evaluated before calling f *)
 (* Do not assume the matched term in tCase is fully evaluated before any branch executes *)
 (* TODO check it is unused in fixpoints/cofixpoints, instead of forbidding them under a let array *)
 (* TODO what to do with primitives *)
@@ -182,9 +184,6 @@ Inductive valid_linear_term : term -> Prop :=
     valid_linear_term (tCase indn c brs)
 | validLinProj (p : projection) (c : term):
     valid_linear_term c -> valid_linear_term (tProj p c)
-(* | validLinFix (mfix : EAst.mfixpoint term) (idx : nat): *) (* TODO *)
-(* | validLinCoFix (mfix : EAst.mfixpoint term) (idx : nat) *) (* TODO *)
-(* | validLinPrim (prim : prim_val term) *) (* TODO *)
 | validLinLazy (t : term):
     valid_linear_term t -> valid_linear_term (tLazy t)
 | validLinForce (t : term):
@@ -197,3 +196,220 @@ Inductive valid_linear_term : term -> Prop :=
 | validLinArraySet (n : nat) (i x : term):
     valid_linear_term i -> valid_linear_term x -> valid_linear_term (tArraySet n i x)
 .
+
+Definition vars_set := list nat.
+
+Fixpoint insert_var (n:nat) (s:vars_set) := match s with
+  | nil => [n]
+  | m :: s' => match n ?= m with
+      | Lt => n :: s
+      | Eq => s
+      | Gt => m :: insert_var n s'
+      end
+  end.
+
+Equations? union_vars (s1 s2 : vars_set) : vars_set by wf (length s1 + length s2) lt :=
+union_vars [] s2 := s2;
+union_vars s1 [] := s1;
+union_vars (n :: s1) (m :: s2) := match n ?= m with
+  | Lt => n :: union_vars s1 (m :: s2)
+  | Eq => n :: union_vars s1 s2
+  | Gt => m :: union_vars (n :: s1) s2
+  end.
+Proof.
+- auto with arith.
+- auto with arith.
+Qed.
+
+Equations? inter_vars (s1 s2 : vars_set) : vars_set by wf (length s1 + length s2) lt :=
+inter_vars [] s2 := s2;
+inter_vars s1 [] := s1;
+inter_vars (n :: s1) (m :: s2) := match n ?= m with
+  | Lt => inter_vars s1 (m :: s2)
+  | Eq => n :: inter_vars s1 s2
+  | Gt => inter_vars (n :: s1) s2
+  end.
+Proof.
+- auto with arith.
+- auto with arith.
+Qed.
+
+Equations? diff_vars (s1 s2 : vars_set) : vars_set by wf (length s1 + length s2) lt :=
+diff_vars [] s2 := s2;
+diff_vars s1 [] := s1;
+diff_vars (n :: s1) (m :: s2) := match n ?= m with
+  | Lt => n :: diff_vars s1 (m :: s2)
+  | Eq => diff_vars s1 s2
+  | Gt => diff_vars (n :: s1) s2
+  end.
+Proof.
+- auto with arith.
+- auto with arith.
+Qed.
+
+Fixpoint unions_vars (ss : list vars_set) : vars_set := match ss with
+  | [] => []
+  | s :: ss' => union_vars s (unions_vars ss')
+  end.
+
+(* We always have read_only_variables <= linear_variables <= used_variables *)
+Record variables_status :=
+  { read_only_variables : vars_set; (* Variables that are only used in read position *)
+    linear_variables : vars_set; (* Variables used in correct linear fashion *)
+    used_variables : vars_set (* Any used variable *)
+  }.
+
+Definition pop_binder_in_rel (n : nat) : list nat :=
+  match n with
+  | O => []
+  | S O => []
+  | S m => [m]
+  end.
+
+Definition pop_binder (tv : variables_status) : variables_status :=
+  {| read_only_variables := flat_map pop_binder_in_rel (read_only_variables tv);
+     linear_variables := flat_map pop_binder_in_rel (linear_variables tv);
+     used_variables := flat_map pop_binder_in_rel (used_variables tv)
+  |}.
+
+Fixpoint pop_binders (n:nat) (tv : variables_status) : variables_status :=
+  match n with
+  | O => tv
+  | S n' => pop_binders n' (pop_binder tv)
+  end.
+
+Definition empty_status : variables_status :=
+  {| read_only_variables := [];
+     linear_variables := [];
+     used_variables := []
+  |}.
+
+(* Variable usage from the result of two actions executed one after another *)
+Definition seq_compose (tv1 tv2 : variables_status) : variables_status :=
+  {| read_only_variables := inter_vars (read_only_variables tv1) (read_only_variables tv2);
+     linear_variables :=
+       union_vars
+         (diff_vars (linear_variables tv1) (used_variables tv2))
+         (inter_vars (read_only_variables tv1) (linear_variables tv2));
+     used_variables := union_vars (used_variables tv1) (used_variables tv2)
+  |}.
+
+(* Variable usage from the result of two actions executed in undefined order *)
+Definition undefined_compose (tv1 tv2 : variables_status) : variables_status :=
+  {| read_only_variables := inter_vars (read_only_variables tv1) (read_only_variables tv2);
+     linear_variables :=
+       union_vars
+         (diff_vars (linear_variables tv1) (used_variables tv2))
+         (diff_vars (linear_variables tv2) (used_variables tv1));
+     used_variables := union_vars (used_variables tv1) (used_variables tv2)
+  |}.
+
+Fixpoint undefined_compose_many (tvs : list variables_status) : variables_status :=
+  match tvs with
+  | [] => empty_status
+  | tv :: tvs' => undefined_compose tv (undefined_compose_many tvs')
+  end.
+
+(* Variable usage from the result of two actions, one of which is executed *)
+Definition one_of_compose (tv1 tv2 : variables_status) : variables_status :=
+  {| read_only_variables := inter_vars (read_only_variables tv1) (read_only_variables tv2);
+     linear_variables := inter_vars (linear_variables tv1) (linear_variables tv2);
+     used_variables := union_vars (used_variables tv1) (used_variables tv2)
+  |}.
+
+Definition one_of_compose_many (tvs : list variables_status) : variables_status :=
+  match tvs with
+  | [] => empty_status
+  | v :: vs => fold_left one_of_compose vs v
+  end.
+
+Fixpoint extract_linear (t: EAst.term): term * variables_status := match t with
+  | EAst.tBox => (tBox, empty_status)
+  | EAst.tRel n => (tRel n, {| read_only_variables := []; linear_variables := [n]; used_variables := [n] |})
+  | EAst.tVar i => (tVar i, empty_status)
+  | EAst.tEvar n l =>
+      let tvs := map extract_linear l in
+      (tEvar n (map fst tvs),
+      {| read_only_variables := [];
+         linear_variables := [];
+         used_variables := unions_vars (map (fun tv => used_variables (snd tv)) tvs)
+      |})
+  | EAst.tLambda na t =>
+      let (t', tv) := extract_linear t in (tLambda na t', pop_binder tv)
+  | EAst.tLetIn na b t =>
+      let (b', bst) := extract_linear b in
+      let (t', tst) := extract_linear t in
+      (tLetIn na b' t', seq_compose bst (pop_binder tst))
+  | EAst.tApp u v =>
+      let (u', ust) := extract_linear u in
+      let (v', vst) := extract_linear v in
+      (tApp u' v', seq_compose ust vst)
+  | EAst.tConst k => (tConst k, empty_status)
+  | EAst.tConstruct ind n args =>
+      let tvs := map extract_linear args in
+      let args' := map fst tvs in
+      let vars := match map snd tvs with
+        | [] => empty_status
+        | (v::vs) => fold_left undefined_compose vs v
+        end in
+      (tConstruct ind n args', vars)
+  | EAst.tCase indn c brs =>
+      let (c', cst) := extract_linear c in
+      let brs' := map (fun nmt => let (t', tst) := extract_linear (snd nmt) in ((fst nmt,t'), pop_binders (length (fst nmt)) tst)) brs in
+      (tCase indn c' (map fst brs'), seq_compose cst (one_of_compose_many (map snd brs')))
+  | EAst.tProj p c =>
+      let (c', cst) := extract_linear c in
+      (tProj p c', cst)
+  | EAst.tFix mfix idx =>
+      let extract_linear_def (d : EAst.def EAst.term) : EAst.def term * variables_status :=
+        let (b,bst) := extract_linear (EAst.dbody d) in
+        ({| EAst.dname := EAst.dname d;
+           EAst.dbody := b;
+           EAst.rarg := EAst.rarg d
+        |},bst) in
+      let mfix' := map extract_linear_def mfix in
+      (tFix (map fst mfix') idx,
+       {| read_only_variables := [];
+          linear_variables := [];
+          used_variables := unions_vars (map (fun fx => used_variables (snd fx)) mfix')
+       |})
+  | EAst.tCoFix mfix idx =>
+      let extract_linear_def (d : EAst.def EAst.term) : EAst.def term * variables_status :=
+        let (b,bst) := extract_linear (EAst.dbody d) in
+        ({| EAst.dname := EAst.dname d;
+           EAst.dbody := b;
+           EAst.rarg := EAst.rarg d
+        |},bst) in
+      let mfix' := map extract_linear_def mfix in
+      (tCoFix (map fst mfix') idx,
+       {| read_only_variables := [];
+          linear_variables := [];
+          used_variables := unions_vars (map (fun fx => used_variables (snd fx)) mfix')
+       |})
+  | EAst.tPrim prim =>
+    let extract_array_model (a : array_model EAst.term) :=
+      let (d,dst) := extract_linear (array_default a) in
+      let vals := map extract_linear (array_value a) in
+      ({| array_default := d; array_value := map fst vals |},
+       one_of_compose dst (undefined_compose_many (map snd vals))) in
+    let extract_prim (p : prim_val EAst.term) :=
+      match p.π2 return prim_val term * variables_status with
+      | primIntModel f =>
+          ((primInt; primIntModel f), empty_status)
+      | primFloatModel f =>
+          ((primFloat; primFloatModel f), empty_status)
+      | primStringModel f =>
+          ((primString; primStringModel f), empty_status)
+      | primArrayModel a =>
+          let (a',ast) := extract_array_model a in
+          ((primArray; primArrayModel a'), ast)
+      end in
+    let (prim',primst) := extract_prim prim in
+    (tPrim prim', primst)
+  | EAst.tLazy t =>
+      let (t', tst) := extract_linear t in
+      (tLazy t', {| read_only_variables := []; linear_variables := []; used_variables := used_variables tst |})
+  | EAst.tForce t =>
+      let (t', tst) := extract_linear t in
+      (tForce t', tst)
+  end.
