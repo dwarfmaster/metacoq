@@ -2,6 +2,7 @@
 
 theories/EPrimitive.v
 theories/EAst.v
+theories/ELinearAst.v
 theories/EAstUtils.v
 theories/EInduction.v
 theories/ELiftSubst.v

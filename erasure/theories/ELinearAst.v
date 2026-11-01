@@ -10,6 +10,23 @@ From Equations Require Import Equations.
 Declare Scope erasure.
 Local Open Scope erasure.
 
+(* Semantics: tAllocate create mutable values. These values can only
+   be mutated through tMemoryUpdate operations, and information read from them
+   only through tMemoryRead. *)
+
+Inductive allocate {T : Set} : Set :=
+| aArrayNew (s b : T) (* Array of size s with cases filled with b *)
+.
+
+Inductive read_memory {T : Set} : Set :=
+| rArrayGet (a i : T) (* Get idx-th element from array *)
+| rArrayLength (a : T) (* Array length *)
+.
+
+Inductive update_memory {T : Set} : Set :=
+| uArraySet (a i x : T) (* a[i] := x *)
+.
+
 Inductive term : Set :=
 | tBox (* Represents all proofs *)
 | tRel (n : nat)
@@ -27,229 +44,138 @@ Inductive term : Set :=
 | tPrim (prim : prim_val term)
 | tLazy (t : term)
 | tForce (t : term)
-| tArrayNew (na : name) (s b t : term) (* let na := new(s,b) : B array in t *)
-| tArrayLength (n : nat)
-| tArrayGet (n : nat) (i : term)
-| tArraySet (n : nat) (i x : term).
+| tAllocate (a : @allocate term) (* Create new mutable memory space *)
+| tMemoryRead (r : @read_memory term)
+| tMemoryUpdate (u : @update_memory term) (* Memory update return the memory position that has been updated *)
+.
 
-Definition map_def' {term term' : Set} (f : term -> term') (d : EAst.def term): EAst.def term' :=
+(* A value is either a functional value, or a memory case *)
+
+Definition map_def' {term term': Set} (f : term -> term') (d : EAst.def term) :=
   {| EAst.dname := d.(EAst.dname); EAst.dbody := f d.(EAst.dbody); EAst.rarg := d.(EAst.rarg) |}.
 
-Fixpoint weaken (t: term): EAst.term := match t with
-| tBox => EAst.tBox 
-| tRel n => EAst.tRel n
-| tVar i => EAst.tVar i 
-| tEvar n l => EAst.tEvar n (map weaken l)
-| tLambda na t => EAst.tLambda na (weaken t)
-| tLetIn na b t => EAst.tLetIn na (weaken b) (weaken t) 
-| tApp u v => EAst.tApp (weaken u) (weaken v)
-| tConst k => EAst.tConst k
-| tConstruct ind n args => EAst.tConstruct ind n (map weaken args)
-| tCase indn c brs => EAst.tCase indn (weaken c) (map (fun br => (fst br, weaken (snd br))) brs)
-| tProj p c => EAst.tProj p (weaken c)
-| tFix mfix idx => EAst.tFix (map (map_def' weaken) mfix) idx
-| tCoFix mfix idx => EAst.tCoFix (map (map_def' weaken) mfix) idx
-| tPrim prim => EAst.tPrim (map_prim weaken prim)
-| tLazy t => EAst.tLazy (weaken t)
-| tForce t => EAst.tForce (weaken t)
-| tArrayNew na s b t => EAst.tVar "Stdlib.Array.PArray.make"
-| tArrayLength n => EAst.tApp (EAst.tVar "Stdlib.Array.PArray.length") (EAst.tRel n)
-| tArrayGet n i =>
-    EAst.tApp (EAst.tApp (EAst.tVar "Stdlib.Array.PArray.get") (EAst.tRel n)) (weaken i)
-| tArraySet n i x =>
-    EAst.tApp (EAst.tApp (EAst.tApp (EAst.tVar "Stdlib.Array.PArray.set") (EAst.tRel n))
-                         (weaken i))
-              (weaken x)
+(* Trivially import an EAst.term to a term, without any transformation *)
+Fixpoint import_term (t : EAst.term) : term := match t with
+| EAst.tBox => tBox
+| EAst.tRel n => tRel n
+| EAst.tVar i => tVar i
+| EAst.tEvar n l => tEvar n (map import_term l)
+| EAst.tLambda na t => tLambda na (import_term t)
+| EAst.tLetIn na b t => tLetIn na (import_term b) (import_term t)
+| EAst.tApp u v => tApp (import_term u) (import_term v)
+| EAst.tConst k => tConst k
+| EAst.tConstruct ind n args => tConstruct ind n (map import_term args)
+| EAst.tCase indn c brs =>
+    tCase indn (import_term c) (map (fun br => (fst br, import_term (snd br))) brs)
+| EAst.tProj p c => tProj p (import_term c)
+| EAst.tFix mfix idx => tFix (map (map_def' import_term) mfix) idx
+| EAst.tCoFix mfix idx => tCoFix (map (map_def' import_term) mfix) idx
+| EAst.tPrim prim =>
+    let import_prim prim := match prim.π2 return prim_val term with
+    | primIntModel f => (primInt; primIntModel f)
+    | primFloatModel f => (primFloat; primFloatModel f)
+    | primStringModel f => (primString; primStringModel f)
+    | primArrayModel a =>
+        (primArray;
+         primArrayModel {| array_default := import_term (array_default a);
+                           array_value := map import_term (array_value a) |})
+    end in tPrim (import_prim prim)
+| EAst.tLazy t => tLazy (import_term t)
+| EAst.tForce t => tForce (import_term t)
 end.
 
-(* Rel is used at most once in a writing position, and is potentially read before that *)
-Inductive is_linear_in : nat -> term -> Prop :=
-| linearRead (n:nat) (t:term) : is_only_read_in n t -> is_linear_in n t
-| linearRel (n r:nat) : n = r -> is_linear_in n (tRel r)
-| linearInLet (n:nat) (na : name) (b t : term):
-    is_linear_in n b -> is_unused_in (S n) t -> is_linear_in n (tLetIn na b t)
-| linearUnderLet (n:nat) (na : name) (b t : term):
-    is_only_read_in n b -> is_linear_in (S n) t -> is_linear_in n (tLetIn na b t)
-| linearAppFn (n:nat) (u v : term):
-    is_linear_in n u -> is_unused_in n v -> is_linear_in n (tApp u v)
-| linearAppArg (n:nat) (u v : term):
-    is_unused_in n u -> is_linear_in n v -> is_linear_in n (tApp u v)
-| linearConstruct (n:nat) (ind:inductive) (c:nat) (args:list term):
-    (exists (i : nat), i < length args /\ (is_linear_in n (nth i args tBox)) /\
-      (forall (j : nat), (j <> i /\ j < length args) -> is_unused_in n (nth j args tBox))) ->
-    is_linear_in n (tConstruct ind c args)
-| linearCaseDiscriminee (n:nat) (indn : inductive*nat) (c:term) (brs : list (list name * term)):
-    is_linear_in n c ->
-    (forall (br : (list name * term)), In br brs -> is_unused_in (n + length (fst br)) (snd br)) ->
-    is_linear_in n (tCase indn c brs)
-| linearCaseBranches (n:nat) (indn : inductive*nat) (c:term) (brs : list (list name * term)):
-    is_unused_in n c ->
-    (forall (br : (list name * term)), In br brs -> is_linear_in (n + length (fst br)) (snd br)) ->
-    is_linear_in n (tCase indn c brs)
-| linearProj (n:nat) (p : projection) (c : term):
-    is_linear_in n c -> is_linear_in n (tProj p c)
-| linearArrayNew (n : nat) (na : name) (s b t : term):
-    is_unused_in n b -> is_linear_in (S n) t -> is_linear_in n (tArrayNew na s b t)
-| linearArrayGet (n a : nat) (i : term):
-    n <> a -> is_linear_in n i -> is_linear_in n (tArrayGet a i)
-| linearArraySet (n a : nat) (i x : term):
-    is_only_read_in n i -> is_only_read_in n x -> n = a ->
-    is_linear_in n (tArraySet a i x)
-| linearArraySetIndex (n a : nat) (i x : term):
-    n <> a -> is_linear_in n i -> is_unused_in n x -> is_linear_in n (tArraySet a i x)
-| linearArraySetValue (n a : nat) (i x : term):
-    n <> a -> is_unused_in n i -> is_linear_in n x -> is_linear_in n (tArraySet a i x)
-(* Rel is used only in read position, potentially many times *)
-with is_only_read_in : nat -> term -> Prop :=
-| readUnused (n:nat) (t:term) : is_unused_in n t -> is_only_read_in n t
-| readLetIn (n:nat) (na:name) (b t : term):
-    is_only_read_in n b -> is_only_read_in (S n) t -> is_only_read_in n (tLetIn na b t)
-| readApp (n:nat) (u v : term):
-    is_only_read_in n u -> is_only_read_in n v -> is_only_read_in n (tApp u v)
-| readConstruct (n:nat) (ind : inductive) (c:nat) (args:list term):
-    (forall (i : nat), i < length args -> is_only_read_in n (nth i args tBox)) ->
-    is_only_read_in n (tConstruct ind c args)
-| readCase (n:nat) (indn:inductive*nat) (c:term) (brs: list (list name * term)) :
-    is_only_read_in n c ->
-    (forall (br : (list name * term)), In br brs -> is_only_read_in (n + length (fst br)) (snd br)) ->
-    is_only_read_in n (tCase indn c brs)
-| readProj (n:nat) (p : projection) (c : term) :
-    is_only_read_in n c -> is_only_read_in n (tProj p c)
-| readArrayNew (n : nat) (na : name) (s b t : term):
-    is_unused_in n b -> is_only_read_in (S n) t -> is_only_read_in n (tArrayNew na s b t)
-| readArrayLength (n : nat) : is_only_read_in n (tArrayLength n)
-| readArrayGet (n a : nat) (i : term):
-    is_only_read_in n i -> is_only_read_in n (tArrayGet a i)
-| readArraySet (n a : nat) (i x : term):
-    n <> a -> is_only_read_in n i -> is_only_read_in n x -> is_only_read_in n (tArraySet a i x)
-(* Rel is unused in the term *)
-with is_unused_in : nat -> term -> Prop :=
-| unusedBox (n:nat) : is_unused_in n tBox
-| unusedRel (n r : nat): n <> r -> is_unused_in n (tRel r)
-| unusedVar (n : nat) (i : ident) : is_unused_in n (tVar i)
-| unusedLambda (n:nat) (na : name) (t : term):
-    is_unused_in (S n) t -> is_unused_in n (tLambda na t)
-| unusedLetIn (n:nat) (na:name) (b t : term):
-    is_unused_in n b -> is_unused_in (S n) t -> is_unused_in n (tLetIn na b t)
-| unusedApp (n:nat) (u v:term):
-    is_unused_in n u -> is_unused_in n v -> is_unused_in n (tApp u v)
-| unusedConst (n:nat) (k:kername) : is_unused_in n (tConst k)
-| unusedConstruct (n:nat) (ind : inductive) (c:nat) (args:list term):
-    (forall (i : nat), i < length args -> is_unused_in n (nth i args tBox)) ->
-    is_unused_in n (tConstruct ind c args)
-| unusedCase (n:nat) (indn:inductive*nat) (c:term) (brs: list (list name * term)) :
-    is_unused_in n c ->
-    (forall (br : (list name * term)), In br brs -> is_unused_in (n + length (fst br)) (snd br)) ->
-    is_unused_in n (tCase indn c brs)
-| unusedProj (n:nat) (p : projection) (c : term):
-    is_unused_in n c -> is_unused_in n (tProj p c)
-| unusedLazy (n:nat) (t:term): is_unused_in n t -> is_unused_in n (tLazy t)
-| unusedForce (n:nat) (t:term): is_unused_in n t -> is_unused_in n (tForce t)
-| unusedArrayNew (n : nat) (na : name) (s b t : term):
-    is_unused_in n b -> is_unused_in (S n) t -> is_unused_in n (tArrayNew na s b t)
-| unusedArrayLength (n a : nat): n <> a -> is_unused_in n (tArrayLength a)
-| unusedArrayGet (n a : nat) (i : term):
-    is_unused_in n i -> n <> a -> is_unused_in n (tArrayGet a i)
-| unusedArraySet (n a : nat) (i x : term):
-    n <> a -> is_unused_in n i -> is_unused_in n x -> is_unused_in n (tArraySet a i x)
-.
+From MetaRocq.Common Require Kernames.
+From Stdlib Require Import Lists.List.
 
-(* Evar might use the variable, so we forbid evars under linear binders *)
-(* Lambda must not capture array variables, because we do not support marking lambda as linear *)
-(* We assume f a b c are evaluated left to right, and that the arguments are fully evaluated before calling f *)
-(* Do not assume the matched term in tCase is fully evaluated before any branch executes *)
-(* TODO check it is unused in fixpoints/cofixpoints, instead of forbidding them under a let array *)
-(* TODO what to do with primitives *)
-(* It must be unused in lazy term, because we cannot control when they are going to be evaluated *)
-
-Inductive valid_linear_term : term -> Prop :=
-| validLinBox: valid_linear_term tBox
-| validLinRel (n : nat): valid_linear_term (tRel n)
-| validLinVar (i : ident): valid_linear_term (tVar i)
-| validLinEvar (n : nat) (l : list term):
-    (forall (t : term), In t l -> valid_linear_term t) -> valid_linear_term (tEvar n l)
-| validLinLambda (na : name) (t : term):
-    valid_linear_term t -> valid_linear_term (tLambda na t)
-| validLinLetIn (na : name) (b t : term):
-    valid_linear_term b -> valid_linear_term t -> valid_linear_term (tLetIn na b t)
-| validLinApp (u v : term):
-    valid_linear_term u -> valid_linear_term v -> valid_linear_term (tApp u v)
-| validLinConst (k : kername): valid_linear_term (tConst k)
-| validLinConstruct (ind : inductive) (n : nat) (args : list term):
-    (forall (t: term), In t args -> valid_linear_term t) ->
-    valid_linear_term (tConstruct ind n args)
-| validLinCase (indn : inductive * nat) (c : term) (brs : list (list name * term)):
-    valid_linear_term c ->
-    (forall (br : (list name * term)), In br brs -> valid_linear_term (snd br)) ->
-    valid_linear_term (tCase indn c brs)
-| validLinProj (p : projection) (c : term):
-    valid_linear_term c -> valid_linear_term (tProj p c)
-| validLinLazy (t : term):
-    valid_linear_term t -> valid_linear_term (tLazy t)
-| validLinForce (t : term):
-    valid_linear_term t -> valid_linear_term (tForce t)
-| validLinArrayNew (na : name) (s b t : term):
-    is_linear_in 1 t -> valid_linear_term s -> valid_linear_term b -> valid_linear_term t -> valid_linear_term (tArrayNew na s b t)
-| validLinArrayLength (n : nat): valid_linear_term (tArrayLength n)
-| validLinArrayGet (n : nat) (i : term):
-    valid_linear_term i -> valid_linear_term  (tArrayGet n i)
-| validLinArraySet (n : nat) (i x : term):
-    valid_linear_term i -> valid_linear_term x -> valid_linear_term (tArraySet n i x)
-.
-
-Definition vars_set := list nat.
-
-Fixpoint insert_var (n:nat) (s:vars_set) := match s with
-  | nil => [n]
-  | m :: s' => match n ?= m with
-      | Lt => n :: s
-      | Eq => s
-      | Gt => m :: insert_var n s'
-      end
+Fixpoint list_eqb {A : Type}
+    (eqb : A -> A -> bool)
+    (xs ys : list A) : bool :=
+  match xs, ys with
+  | nil, nil => true
+  | x :: xs', y :: ys' => eqb x y && list_eqb eqb xs' ys'
+  | _, _ => false
   end.
 
-Equations? union_vars (s1 s2 : vars_set) : vars_set by wf (length s1 + length s2) lt :=
-union_vars [] s2 := s2;
-union_vars s1 [] := s1;
-union_vars (n :: s1) (m :: s2) := match n ?= m with
-  | Lt => n :: union_vars s1 (m :: s2)
-  | Eq => n :: union_vars s1 s2
-  | Gt => m :: union_vars (n :: s1) s2
-  end.
-Proof.
-- auto with arith.
-- auto with arith.
-Qed.
+Definition is_parray_op (op : ident) (t : term) : bool := match t with
+| tConst (Kernames.MPfile fl, i) =>
+    list_eqb String.eqb fl ["PrimArray"; "Array"; "Corelib"] && String.eqb i op
+| _ => false
+end.
 
-Equations? inter_vars (s1 s2 : vars_set) : vars_set by wf (length s1 + length s2) lt :=
-inter_vars [] s2 := s2;
-inter_vars s1 [] := s1;
-inter_vars (n :: s1) (m :: s2) := match n ?= m with
-  | Lt => inter_vars s1 (m :: s2)
-  | Eq => n :: inter_vars s1 s2
-  | Gt => inter_vars (n :: s1) s2
-  end.
-Proof.
-- auto with arith.
-- auto with arith.
-Qed.
+(* Transform any primitive array operation into term constructors, even if their
+   usage would be invalid. After applying this function, you should find_linear
+   and correct_term to revert this transformation on the wrong terms *)
+Fixpoint parray_ops (t : term) : term := match t with
+(* Interesting case *)
+| tApp u v => match u with
+  | tApp u' v' => match u' with
+    | tApp u'' v'' =>
+        if is_parray_op "set" u''
+        then tMemoryUpdate (uArraySet (parray_ops v'') (parray_ops v') (parray_ops v))
+        else tApp (parray_ops u) (parray_ops v)
+    | _ =>
+        if is_parray_op "make" u'
+        then tAllocate (aArrayNew (parray_ops v') (parray_ops v))
+        else if is_parray_op "get" u'
+        then tMemoryRead (rArrayGet (parray_ops v') (parray_ops v))
+        else tApp (parray_ops u) (parray_ops v)
+    end
+  | _ =>
+    if is_parray_op "length" u
+    then tMemoryRead (rArrayLength (parray_ops v))
+    else tApp (parray_ops u) (parray_ops v)
+  end
 
-Equations? diff_vars (s1 s2 : vars_set) : vars_set by wf (length s1 + length s2) lt :=
-diff_vars [] s2 := s2;
-diff_vars s1 [] := s1;
-diff_vars (n :: s1) (m :: s2) := match n ?= m with
-  | Lt => n :: diff_vars s1 (m :: s2)
-  | Eq => diff_vars s1 s2
-  | Gt => diff_vars (n :: s1) s2
-  end.
-Proof.
-- auto with arith.
-- auto with arith.
-Qed.
+(* Propagating trough pure constructors *)
+| tBox => tBox
+| tRel n => tRel n
+| tVar i => tVar i
+| tEvar n l => tEvar n (map parray_ops l)
+| tLambda na t => tLambda na (parray_ops t)
+| tLetIn na b t => tLetIn na (parray_ops b) (parray_ops t)
+| tConst k => tConst k
+| tConstruct ind n args => tConstruct ind n (map parray_ops args)
+| tCase indn c brs =>
+    tCase indn (parray_ops c) (map (fun br => (fst br, parray_ops (snd br))) brs)
+| tProj p c => tProj p (parray_ops c)
+| tFix mfix idx => tFix (map (map_def' parray_ops) mfix) idx
+| tCoFix mfix idx => tCoFix (map (map_def' parray_ops) mfix) idx
+| tPrim prim =>
+    let import_prim prim := match prim.π2 return prim_val term with
+    | primIntModel f => (primInt; primIntModel f)
+    | primFloatModel f => (primFloat; primFloatModel f)
+    | primStringModel f => (primString; primStringModel f)
+    | primArrayModel a =>
+        (primArray;
+         primArrayModel {| array_default := parray_ops (array_default a);
+                           array_value := map parray_ops (array_value a) |})
+    end in tPrim (import_prim prim)
+| tLazy t => tLazy (parray_ops t)
+| tForce t => tForce (parray_ops t)
+
+(* Assume the operation has already been done on impure operations *)
+| _ => t
+end.
+
+(* For each term constructor, we determine if each subterm appear in a position
+   where a memory case can be used instead of a plain value. This property depends
+   on whether the term itself is in a position where a memory case can be used. We
+   push this information down, and we bring up how variables are used. Variables
+   will be realised as memory location if:
+     - they are only used in places where memory locations are expected
+     - their usage is linear
+     - they are defined as a term that produces a memory location
+   *)
+
+From Stdlib Require MSets.MSetAVL.
+From Stdlib Require Import Structures.OrdersEx.
+
+Module VarsSet := MSetAVL.Make(Nat_as_OT).
+Definition vars_set := VarsSet.t.
 
 Fixpoint unions_vars (ss : list vars_set) : vars_set := match ss with
-  | [] => []
-  | s :: ss' => union_vars s (unions_vars ss')
+  | [] => VarsSet.empty
+  | s :: ss' => VarsSet.union s (unions_vars ss')
   end.
 
 (* We always have read_only_variables <= linear_variables <= used_variables *)
@@ -259,17 +185,42 @@ Record variables_status :=
     used_variables : vars_set (* Any used variable *)
   }.
 
-Definition pop_binder_in_rel (n : nat) : list nat :=
+Definition is_read_only (vs : variables_status) (n : nat) : bool :=
+  VarsSet.mem n (read_only_variables vs).
+Definition is_linear (vs : variables_status) (n : nat) : bool :=
+  VarsSet.mem n (linear_variables vs).
+Definition is_used (vs : variables_status) (n : nat) : bool :=
+  VarsSet.mem n (used_variables vs).
+
+Definition mk_read_only (n : nat) : variables_status :=
+  {| read_only_variables := VarsSet.singleton n;
+     linear_variables := VarsSet.singleton n;
+     used_variables := VarsSet.singleton n
+  |}.
+Definition mk_linear (n : nat) : variables_status :=
+  {| read_only_variables := VarsSet.empty;
+     linear_variables := VarsSet.singleton n;
+     used_variables := VarsSet.singleton n
+  |}.
+Definition mk_used (n : nat) : variables_status :=
+  {| read_only_variables := VarsSet.empty;
+     linear_variables := VarsSet.empty;
+     used_variables := VarsSet.singleton n
+  |}.
+
+Definition pop_binder_in_rel (n : nat) : vars_set -> vars_set :=
   match n with
-  | O => []
-  | S O => []
-  | S m => [m]
+  | O => id
+  | S m => VarsSet.add m
   end.
 
+Definition pop_binder_in_set (v : vars_set) : vars_set :=
+  VarsSet.fold (fun x acc => pop_binder_in_rel x acc) v VarsSet.empty.
+
 Definition pop_binder (tv : variables_status) : variables_status :=
-  {| read_only_variables := flat_map pop_binder_in_rel (read_only_variables tv);
-     linear_variables := flat_map pop_binder_in_rel (linear_variables tv);
-     used_variables := flat_map pop_binder_in_rel (used_variables tv)
+  {| read_only_variables := pop_binder_in_set (read_only_variables tv);
+     linear_variables := pop_binder_in_set (linear_variables tv);
+     used_variables := pop_binder_in_set (used_variables tv)
   |}.
 
 Fixpoint pop_binders (n:nat) (tv : variables_status) : variables_status :=
@@ -279,30 +230,41 @@ Fixpoint pop_binders (n:nat) (tv : variables_status) : variables_status :=
   end.
 
 Definition empty_status : variables_status :=
-  {| read_only_variables := [];
-     linear_variables := [];
-     used_variables := []
+  {| read_only_variables := VarsSet.empty;
+     linear_variables := VarsSet.empty;
+     used_variables := VarsSet.empty
+  |}.
+
+Definition generic_compose
+  (mkLinear : vars_set -> vars_set -> vars_set -> vars_set -> vars_set -> vars_set -> vars_set)
+  (tv1 tv2 : variables_status) : variables_status :=
+  {| read_only_variables := 
+       unions_vars [
+         VarsSet.inter (read_only_variables tv1) (read_only_variables tv2);
+         VarsSet.diff (read_only_variables tv1) (used_variables tv2);
+         VarsSet.diff (read_only_variables tv2) (used_variables tv1)
+       ];
+     linear_variables :=
+       let lin := mkLinear (read_only_variables tv1)
+                           (read_only_variables tv2)
+                           (linear_variables tv1)
+                           (linear_variables tv2)
+                           (used_variables tv1)
+                           (used_variables tv2) in
+       VarsSet.union lin
+         (VarsSet.union
+           (VarsSet.diff (linear_variables tv1) (used_variables tv2))
+           (VarsSet.diff (linear_variables tv2) (used_variables tv1)));
+     used_variables := VarsSet.union (used_variables tv1) (used_variables tv2)
   |}.
 
 (* Variable usage from the result of two actions executed one after another *)
-Definition seq_compose (tv1 tv2 : variables_status) : variables_status :=
-  {| read_only_variables := inter_vars (read_only_variables tv1) (read_only_variables tv2);
-     linear_variables :=
-       union_vars
-         (diff_vars (linear_variables tv1) (used_variables tv2))
-         (inter_vars (read_only_variables tv1) (linear_variables tv2));
-     used_variables := union_vars (used_variables tv1) (used_variables tv2)
-  |}.
+Definition seq_compose : variables_status -> variables_status -> variables_status :=
+  generic_compose (fun ro1 ro2 lin1 lin2 used1 used2 => VarsSet.inter ro1 lin2).
 
 (* Variable usage from the result of two actions executed in undefined order *)
-Definition undefined_compose (tv1 tv2 : variables_status) : variables_status :=
-  {| read_only_variables := inter_vars (read_only_variables tv1) (read_only_variables tv2);
-     linear_variables :=
-       union_vars
-         (diff_vars (linear_variables tv1) (used_variables tv2))
-         (diff_vars (linear_variables tv2) (used_variables tv1));
-     used_variables := union_vars (used_variables tv1) (used_variables tv2)
-  |}.
+Definition undefined_compose : variables_status -> variables_status -> variables_status :=
+  generic_compose (fun ro1 ro2 lin1 lin2 used1 used2 => VarsSet.inter ro1 ro2).
 
 Fixpoint undefined_compose_many (tvs : list variables_status) : variables_status :=
   match tvs with
@@ -311,11 +273,8 @@ Fixpoint undefined_compose_many (tvs : list variables_status) : variables_status
   end.
 
 (* Variable usage from the result of two actions, one of which is executed *)
-Definition one_of_compose (tv1 tv2 : variables_status) : variables_status :=
-  {| read_only_variables := inter_vars (read_only_variables tv1) (read_only_variables tv2);
-     linear_variables := inter_vars (linear_variables tv1) (linear_variables tv2);
-     used_variables := union_vars (used_variables tv1) (used_variables tv2)
-  |}.
+Definition one_of_compose : variables_status -> variables_status -> variables_status :=
+  generic_compose (fun ro1 ro2 lin1 lin2 used1 used2 => VarsSet.inter lin1 lin2).
 
 Definition one_of_compose_many (tvs : list variables_status) : variables_status :=
   match tvs with
@@ -323,93 +282,372 @@ Definition one_of_compose_many (tvs : list variables_status) : variables_status 
   | v :: vs => fold_left one_of_compose vs v
   end.
 
-Fixpoint extract_linear (t: EAst.term): term * variables_status := match t with
-  | EAst.tBox => (tBox, empty_status)
-  | EAst.tRel n => (tRel n, {| read_only_variables := []; linear_variables := [n]; used_variables := [n] |})
-  | EAst.tVar i => (tVar i, empty_status)
-  | EAst.tEvar n l =>
-      let tvs := map extract_linear l in
-      (tEvar n (map fst tvs),
-      {| read_only_variables := [];
-         linear_variables := [];
-         used_variables := unions_vars (map (fun tv => used_variables (snd tv)) tvs)
-      |})
-  | EAst.tLambda na t =>
-      let (t', tv) := extract_linear t in (tLambda na t', pop_binder tv)
-  | EAst.tLetIn na b t =>
-      let (b', bst) := extract_linear b in
-      let (t', tst) := extract_linear t in
-      (tLetIn na b' t', seq_compose bst (pop_binder tst))
-  | EAst.tApp u v =>
-      let (u', ust) := extract_linear u in
-      let (v', vst) := extract_linear v in
-      (tApp u' v', seq_compose ust vst)
-  | EAst.tConst k => (tConst k, empty_status)
-  | EAst.tConstruct ind n args =>
-      let tvs := map extract_linear args in
-      let args' := map fst tvs in
-      let vars := match map snd tvs with
-        | [] => empty_status
-        | (v::vs) => fold_left undefined_compose vs v
-        end in
-      (tConstruct ind n args', vars)
-  | EAst.tCase indn c brs =>
-      let (c', cst) := extract_linear c in
-      let brs' := map (fun nmt => let (t', tst) := extract_linear (snd nmt) in ((fst nmt,t'), pop_binders (length (fst nmt)) tst)) brs in
-      (tCase indn c' (map fst brs'), seq_compose cst (one_of_compose_many (map snd brs')))
-  | EAst.tProj p c =>
-      let (c', cst) := extract_linear c in
-      (tProj p c', cst)
-  | EAst.tFix mfix idx =>
-      let extract_linear_def (d : EAst.def EAst.term) : EAst.def term * variables_status :=
-        let (b,bst) := extract_linear (EAst.dbody d) in
-        ({| EAst.dname := EAst.dname d;
-           EAst.dbody := b;
-           EAst.rarg := EAst.rarg d
-        |},bst) in
-      let mfix' := map extract_linear_def mfix in
-      (tFix (map fst mfix') idx,
-       {| read_only_variables := [];
-          linear_variables := [];
-          used_variables := unions_vars (map (fun fx => used_variables (snd fx)) mfix')
-       |})
-  | EAst.tCoFix mfix idx =>
-      let extract_linear_def (d : EAst.def EAst.term) : EAst.def term * variables_status :=
-        let (b,bst) := extract_linear (EAst.dbody d) in
-        ({| EAst.dname := EAst.dname d;
-           EAst.dbody := b;
-           EAst.rarg := EAst.rarg d
-        |},bst) in
-      let mfix' := map extract_linear_def mfix in
-      (tCoFix (map fst mfix') idx,
-       {| read_only_variables := [];
-          linear_variables := [];
-          used_variables := unions_vars (map (fun fx => used_variables (snd fx)) mfix')
-       |})
-  | EAst.tPrim prim =>
-    let extract_array_model (a : array_model EAst.term) :=
-      let (d,dst) := extract_linear (array_default a) in
-      let vals := map extract_linear (array_value a) in
-      ({| array_default := d; array_value := map fst vals |},
-       one_of_compose dst (undefined_compose_many (map snd vals))) in
-    let extract_prim (p : prim_val EAst.term) :=
-      match p.π2 return prim_val term * variables_status with
-      | primIntModel f =>
-          ((primInt; primIntModel f), empty_status)
-      | primFloatModel f =>
-          ((primFloat; primFloatModel f), empty_status)
-      | primStringModel f =>
-          ((primString; primStringModel f), empty_status)
-      | primArrayModel a =>
-          let (a',ast) := extract_array_model a in
-          ((primArray; primArrayModel a'), ast)
-      end in
-    let (prim',primst) := extract_prim prim in
-    (tPrim prim', primst)
-  | EAst.tLazy t =>
-      let (t', tst) := extract_linear t in
-      (tLazy t', {| read_only_variables := []; linear_variables := []; used_variables := used_variables tst |})
-  | EAst.tForce t =>
-      let (t', tst) := extract_linear t in
-      (tForce t', tst)
-  end.
+(* Helpers *)
+Definition inspect {A : Type} (a : A) :
+  {b : A | a = b} :=
+  exist _ a eq_refl.
+Notation "x 'eqn:' p" :=
+  (exist _ x p)
+  (only parsing, at level 20).
+
+From Stdlib Require Import FSets.FMapAVL.
+From Stdlib Require Import FSets.FMapFacts.
+From Stdlib Require Structures.OrderedTypeEx.
+(* Very basic and unoptimised union-find *)
+Module UF.
+  Module NM := FMapAVL.Make(OrderedTypeEx.Nat_as_OT).
+  Module NMF := FMapFacts.WFacts_fun Nat_as_OT NM.
+  Definition well_founded_map (mp : NM.t nat) : Prop :=
+    forall (n : nat),
+      match NM.find n mp with
+      | None => True
+      | Some m => m < n
+      end.
+  Definition t := { mp: NM.t nat & well_founded_map mp }.
+
+  Equations? empty : t :=
+  empty := existT _ (NM.empty nat) _.
+  Proof. unfold well_founded_map. intro n. simpl. auto. Qed.
+
+  Equations? lookup (uf : t) (n : nat) : nat by wf n lt :=
+  lookup uf n with inspect (NM.find n (projT1 uf)) := {
+    | Some m eqn:H => lookup uf m
+    | None   eqn:H => n
+  }.
+  Proof.
+    pose proof (Huf := projT2 uf n). simpl in Huf. unfold well_founded_map in Huf.
+    unfold well_founded_map in H. rewrite H in Huf. exact Huf.
+  Qed.
+
+  Definition check (uf : t) (n1 n2 : nat) : bool := (lookup uf n1) =? (lookup uf n2).
+  Equations? connect (uf : t) (n1 n2 : nat) : t :=
+  connect uf n1 n2 with inspect (lookup uf n1 ?= lookup uf n2) := {
+    | Lt eqn:H => existT _ (NM.add (lookup uf n2) (lookup uf n1) (projT1 uf)) _
+    | Eq eqn:H => uf
+    | Gt eqn:H => existT _ (NM.add (lookup uf n1) (lookup uf n2) (projT1 uf)) _
+  }.
+  Proof.
+    - unfold well_founded_map. intro n.
+      destruct (Nat.eq_dec n (lookup uf n2)) as [Heq | Hneq].
+      + rewrite Heq. rewrite NMF.add_eq_o; try reflexivity.
+        apply Nat.compare_lt_iff. assumption.
+      + rewrite NMF.add_neq_o; try auto. exact (projT2 uf n).
+    - unfold well_founded_map. intro n.
+      destruct (Nat.eq_dec n (lookup uf n1)) as [Heq | Hneq].
+      + rewrite Heq. rewrite NMF.add_eq_o; try reflexivity.
+        apply Nat.compare_gt_iff. assumption.
+      + rewrite NMF.add_neq_o; try auto. exact (projT2 uf n).
+  Qed.
+End UF.
+
+Inductive mutability_status :=
+  | mutable_read (mut_if : option nat)
+  | mutable_write (mut_if : option nat)
+  | immutable.
+
+Fixpoint padvars (n : nat) (l : list nat) : list nat := match n with
+| O => l
+| S n' => padvars n' (0 :: l)
+end.
+
+Definition connect_if_some uf (n : option nat) (m : nat) := match n with
+| None => uf
+| Some n' => UF.connect uf n' m
+end.
+
+(* Lambda must not capture array variables, because we do not support marking lambda as linear *)
+(* We assume f a b c are evaluated left to right, and that the arguments are fully evaluated before calling f *)
+(* Assume the matched term in tCase is fully evaluated before any branch executes *)
+(* TODO what to do with primitives *)
+(* It must be unused in lazy term, because we cannot control when they are going to be evaluated *)
+Equations find_linear
+  (* The natural is used to enumerate all bound variables, case and allocation
+     within the term, starting from 1. Two locations are connected in the union-find
+     is they must have the same mutability. Locations are connected to 0 to show
+     they must be immutable *)
+  (iuf : nat * UF.t)
+  (* Map De Bruijn indices to variable enumeration *)
+  (vars : list nat)
+  (* Indicate if we're within a mutable context, a immutable 
+     one, or one that depends on a variable *)
+  (mut : mutability_status)
+  (* The term to inspect *)
+  (t : term)
+  (* The variables_status is the usage of the local variable in the sub term,
+     especially if their usage is linear. The boolean indicates if the term can
+     construct a mutable array. It also returns updates to the binder counting and
+     the union-find. *)
+  : (variables_status * bool) * (nat * UF.t)
+  by struct t :=
+
+(* The main case: propagate a variable status and mark it as immutable if its
+   usage is not linear *)
+find_linear (i, uf) vars mut (tLetIn na b t) :=
+  let '((vsb, tmut), iuf') := find_linear (i+1, uf) vars (mutable_write (Some i)) b in
+  let '((vst, bmut), iuf'') := find_linear iuf' (i :: vars) mut t in
+  let (i'', uf'') := iuf'' in
+  let uf''' := if tmut && is_linear vst 0 then uf'' else UF.connect uf'' i 0 in
+  ((seq_compose vsb (pop_binder vst), bmut), (i'', uf'''));
+
+find_linear (i, uf) vars mut (tRel n) :=
+  let var := nth n vars 0 in
+  match mut with
+  | mutable_read mut_if => ((mk_read_only n, true), (i, connect_if_some uf mut_if var))
+  | mutable_write mut_if => ((mk_linear n, true), (i, connect_if_some uf mut_if var))
+  | immutable => ((mk_used n, false), (i, UF.connect uf var 0))
+  end;
+
+find_linear (i, uf) vars mut (tCase indn c brs) :=
+  let (nmut,uf') := match mut with
+  | mutable_read mut_if => (mutable_read (Some i), connect_if_some uf mut_if i)
+  | mutable_write mut_if => (mutable_write (Some i), connect_if_some uf mut_if i)
+  | immutable => (immutable, UF.connect uf 0 i)
+  end in
+  let '((vsc, _), iuf') := find_linear (i + 1, uf') vars immutable c in
+  let accum := (fun (acc : ((nat * UF.t) * variables_status * bool)) br =>
+    let '((iuf, vs), amut) := acc in
+    let toshift := length (fst br) in
+    let '((vst, rmut), iuf') := find_linear iuf (padvars toshift vars) nmut (snd br) in
+    ((iuf', one_of_compose vs (pop_binders toshift vst)), amut && rmut)) in
+  let '((iuf'', vsbrs), rmut) := fold_left accum brs ((iuf', empty_status), true) in
+  let (i'', uf'') := iuf'' in
+  let uf''' := if rmut then uf'' else UF.connect uf'' i 0 in
+  ((seq_compose vsc vsbrs, rmut), (i'', uf'''));
+
+(* Mutable cases *)
+find_linear (i, uf) vars mut (tAllocate (aArrayNew s b)) :=
+  let (rmut,uf') := match mut with
+  | mutable_read mut_if => (true, connect_if_some uf mut_if i)
+  | mutable_write mut_if => (true, connect_if_some uf mut_if i)
+  | immutable => (false, UF.connect uf 0 i)
+  end in
+  let '((vss, _), iuf') := find_linear (i + 1, uf') vars immutable s in
+  let '((vsb, _), iuf'') := find_linear iuf' vars immutable b in
+  ((seq_compose vss vsb, rmut), iuf'');
+
+find_linear iuf vars _ (tMemoryRead (rArrayGet a i)) :=
+  let '((vsa, _), iuf') := find_linear iuf vars (mutable_read None) a in
+  let '((vsi, _), iuf'') := find_linear iuf' vars immutable i in
+  ((seq_compose vsa vsi, false), iuf'');
+
+find_linear iuf vars _ (tMemoryRead (rArrayLength a)) :=
+  let '((vsa, _), iuf') := find_linear iuf vars (mutable_read None) a in
+  ((vsa, false), iuf');
+
+find_linear iuf vars mut (tMemoryUpdate (uArraySet a i x)) :=
+  let '((vsa, rmut), iuf') := find_linear iuf vars mut a in
+  let '((vsi, _), iuf'') := find_linear iuf' vars immutable i in
+  let '((vsx, _), iuf''') := find_linear iuf'' vars immutable x in
+  ((seq_compose (seq_compose vsa vsi) vsx, rmut), iuf''');
+
+(* Other cases *)
+find_linear iuf vars _ (tEvar _ l) := 
+  let l' := map (fun t => used_variables (fst (fst (find_linear iuf vars immutable t)))) l in
+  ( ({| read_only_variables := VarsSet.empty;
+        linear_variables := VarsSet.empty;
+        used_variables := unions_vars l'
+     |}, false), iuf);
+
+find_linear iuf vars _ (tLambda na t) :=
+  let (vs, iuf') := find_linear iuf (0 :: vars) immutable t in
+  ((pop_binder (fst vs), false), iuf');
+
+find_linear iuf vars _ (tApp u v) :=
+  let '((vsu, _), iuf') := find_linear iuf vars immutable u in
+let '((vsv, _), iuf'') := find_linear iuf' vars immutable v in (* Arguments to arbitrary functions are always immutable *)
+  ((seq_compose vsu vsv, false), iuf'');
+
+find_linear iuf vars _ (tConstruct ind n args) :=
+  let accum := (fun (acc : ((nat * UF.t) * variables_status)) t =>
+    let (iuf, vs) := acc in
+    let '((vst, _), iuf') := find_linear iuf vars immutable t in
+    (iuf', seq_compose vs vst)) in
+  let (iuf', vs) := fold_left accum args (iuf, empty_status) in
+  ((vs, false), iuf');
+
+find_linear iuf vars _ (tProj p c) :=
+  let '((vsc, _), iuf') := find_linear iuf vars immutable c in
+  ((vsc, false), iuf');
+
+find_linear iuf vars _ (tLazy t) :=
+  let '((vs, _), iuf') := find_linear iuf vars immutable t in
+  (({| read_only_variables := VarsSet.empty;
+       linear_variables := VarsSet.empty;
+       used_variables := used_variables vs
+    |}, false), iuf');
+find_linear iuf vars _ (tForce t) :=
+  let '((vs, _), iuf') := find_linear iuf vars immutable t in
+  (({| read_only_variables := VarsSet.empty;
+       linear_variables := VarsSet.empty;
+       used_variables := used_variables vs
+    |}, false), iuf');
+
+find_linear iuf vars _ (tFix mfix idx) :=
+  let accum := (fun (acc : ((nat * UF.t) * variables_status)) d =>
+    let (iuf, vs) := acc in
+    let '((vst, _), iuf') := find_linear iuf vars immutable (EAst.dbody d) in
+    (iuf', undefined_compose vs vst)) in
+  let (iuf', vs) := fold_left accum mfix (iuf, empty_status) in
+  (({| read_only_variables := VarsSet.empty;
+       linear_variables := VarsSet.empty;
+       used_variables := used_variables vs
+    |}, false), iuf');
+find_linear iuf vars _ (tCoFix mfix idx) :=
+  let accum := (fun (acc : ((nat * UF.t) * variables_status)) d =>
+    let (iuf, vs) := acc in
+    let '((vst, _), iuf') := find_linear iuf vars immutable (EAst.dbody d) in
+    (iuf', undefined_compose vs vst)) in
+  let (iuf', vs) := fold_left accum mfix (iuf, empty_status) in
+  (({| read_only_variables := VarsSet.empty;
+       linear_variables := VarsSet.empty;
+       used_variables := used_variables vs
+    |}, false), iuf');
+
+find_linear iuf vars _ (tPrim prim) :=
+  match prim.π2 with
+  | primIntModel f => ((empty_status, false), iuf)
+  | primFloatModel f => ((empty_status, false), iuf)
+  | primStringModel f => ((empty_status, false), iuf)
+  | primArrayModel a =>
+      let '((vsd,_), iuf') := find_linear iuf vars immutable (array_default a) in
+      let accum := (fun (acc : ((nat * UF.t) * variables_status)) t =>
+        let (iuf, vs) := acc in
+        let '((vst, _), iuf') := find_linear iuf vars immutable t in
+        (iuf', undefined_compose vs vst)) in
+      let (iuf'', vs) := fold_left accum (array_value a) (iuf', empty_status) in
+      ((one_of_compose vsd vs, false), iuf'')
+  end;
+  
+find_linear iuf _ _ tBox := ((empty_status, false), iuf);
+find_linear iuf _ _ (tVar _) := ((empty_status, false), iuf);
+find_linear iuf _ _ (tConst _) := ((empty_status, false), iuf);
+.
+
+Definition mk_parray_op (op : ident) : term :=
+  tConst (Kernames.MPfile ["PrimArray"; "Array"; "Corelib"], op).
+
+Equations extract_impl (i : nat) (uf : UF.t) (vars : list bool) (t : term) : (term * bool) * nat :=
+
+extract_impl i uf vars (tLetIn na b t) :=
+  let is_mut := negb (UF.check uf i 0) in
+  let '((b',_), i') := extract_impl (i+1) uf vars b in
+  let '((t',mut'), i'') := extract_impl i' uf (is_mut :: vars) t in
+  ((tLetIn na b' t', mut'), i'');
+
+extract_impl i _ vars (tRel n) :=
+  ((tRel n, nth n vars false), i);
+
+extract_impl i uf vars (tApp u v) :=
+  let '((u',_), i') := extract_impl i uf vars u in
+  let '((v',_), i'') := extract_impl i' uf vars v in
+  ((tApp u' v', false), i'');
+
+extract_impl i uf vars (tConstruct ind n args) :=
+  let accum := (fun (acc : (nat * list term)) t =>
+    let (i, ts) := acc in
+    let '((t',_), i') := extract_impl i uf vars t in
+    (i', ts ++ [t'])) in
+  let (i', ts) := fold_left accum args (i, []) in
+  ((tConstruct ind n ts, false), i');
+
+extract_impl i uf vars (tCase indn c brs) :=
+  let is_mut := negb (UF.check uf i 0) in
+  let '((c',_), i') := extract_impl (i+1) uf vars c in
+  let accum := (fun (acc : (nat * list (list name * term))) br =>
+    let '(i, ts) := acc in
+    let '((br',_), i') := extract_impl i uf vars (snd br) in
+    (i', ts ++ [(fst br, br')])) in
+  let '(i'', brs') := fold_left accum brs (i', []) in
+  ((tCase indn c' brs', is_mut), i'');
+
+extract_impl i uf vars (tProj p c) :=
+  let '((c',_), i') := extract_impl i uf vars c in
+  ((tProj p c', false), i');
+
+extract_impl i uf vars (tFix mfix idx) :=
+  let accum := (fun (acc : (nat * list (EAst.def term))) d =>
+    let (i, ds) := acc in
+    let '((db',_), i') := extract_impl i uf vars (EAst.dbody d) in
+    let d' := {| EAst.dname := EAst.dname d;
+                 EAst.dbody := db';
+                 EAst.rarg := EAst.rarg d
+              |} in
+    (i', ds ++ [d'])) in
+  let (i', ds) := fold_left accum mfix (i, []) in
+  ((tFix ds idx, false), i');
+extract_impl i uf vars (tCoFix mfix idx) :=
+  let accum := (fun (acc : (nat * list (EAst.def term))) d =>
+    let (i, ds) := acc in
+    let '((db',_), i') := extract_impl i uf vars (EAst.dbody d) in
+    let d' := {| EAst.dname := EAst.dname d;
+                 EAst.dbody := db';
+                 EAst.rarg := EAst.rarg d
+              |} in
+    (i', ds ++ [d'])) in
+  let (i', ds) := fold_left accum mfix (i, []) in
+  ((tCoFix ds idx, false), i');
+
+extract_impl i uf vars (tPrim prim) :=
+  match prim.π2 with
+  | primIntModel f => ((tPrim (primInt; primIntModel f), false), i)
+  | primFloatModel f => ((tPrim (primFloat; primFloatModel f), false), i)
+  | primStringModel f => ((tPrim (primString; primStringModel f), false), i)
+  | primArrayModel a =>
+      let '((d,_), i') := extract_impl i uf vars (array_default a) in
+      let accum := (fun (acc : (nat * list term)) t =>
+        let (i, ts) := acc in
+        let '((t',_), i') := extract_impl i uf vars t in
+        (i', ts ++ [t'])) in
+      let (i'', vs) := fold_left accum (array_value a) (i', []) in
+      let prim' := primArrayModel {| array_default := d; array_value := vs |} in
+      ((tPrim (primArray; prim'), false), i'')
+  end;
+
+extract_impl i uf vars (tLazy t) :=
+  let '((t', _), i') := extract_impl i uf vars t in
+  ((tLazy t', false), i');
+extract_impl i uf vars (tForce t) :=
+  let '((t', _), i') := extract_impl i uf vars t in
+  ((tForce t', false), i');
+
+extract_impl i _ _ (tConst k) := ((tConst k, false), i);
+extract_impl i _ _ tBox := ((tBox, false), i);
+extract_impl i _ _ (tVar j) := ((tVar j, false), i);
+extract_impl i uf vars (tEvar n l) :=
+  ((tEvar n (map (fun t => fst (fst (extract_impl i uf vars t))) l), false), i);
+extract_impl i uf vars (tLambda na t) :=
+  let '((t',_), i') := extract_impl i uf vars t in
+  ((tLambda na t', false), i');
+
+extract_impl i uf vars (tAllocate (aArrayNew s b)) :=
+  let is_mut := negb (UF.check uf i 0) in
+  let '((s',_), i') := extract_impl (i+1) uf vars s in
+  let '((b',_), i'') := extract_impl i' uf vars b in
+  if is_mut
+  then ((tAllocate (aArrayNew s' b'), true), i'')
+  else ((tApp (tApp (mk_parray_op "make") s') b', false), i'');
+extract_impl i uf vars (tMemoryRead (rArrayGet a ix)) :=
+  let '((a',mut), i') := extract_impl i uf vars a in
+  let '((ix',_), i'') := extract_impl i' uf vars ix in
+  if mut
+  then ((tMemoryRead (rArrayGet a' ix'), false), i'')
+  else ((tApp (tApp (mk_parray_op "get") a') ix', false), i'');
+extract_impl i uf vars (tMemoryRead (rArrayLength a)) :=
+  let '((a',mut), i') := extract_impl i uf vars a in
+  if mut
+  then ((tMemoryRead (rArrayLength a'), false), i')
+  else ((tApp (mk_parray_op "length") a', false), i');
+extract_impl i uf vars (tMemoryUpdate (uArraySet a ix v)) :=
+  let '((a', mut), i') := extract_impl i uf vars a in
+  let '((ix', _), i'') := extract_impl i' uf vars ix in
+  let '((v', _), i''') := extract_impl i'' uf vars v in
+  if mut
+  then ((tMemoryUpdate (uArraySet a' ix' v'), true), i''')
+  else ((tApp (tApp (tApp (mk_parray_op "set") a') ix') v', false), i''')
+.
+
+Definition optimize_arrays (t : EAst.term) : term :=
+  let imported := parray_ops (import_term t) in
+  let '(_, (_, uf)) := find_linear (1, UF.empty) [] immutable imported in
+  let '((r,_),_) := extract_impl 1 uf [] imported in
+  r.
