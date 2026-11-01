@@ -7,6 +7,50 @@ From MetaRocq.Erasure Require Import EPrimitive.
 From MetaRocq.Common Require Import Primitive.
 From Equations Require Import Equations.
 
+(* The term AST represent embed the entire lambdabox, along with new
+   constructors dealing with the allocation, mutation and extraction of data from
+   memory cases. As of now we only support primitive array operations. We
+   automatically detect lambdabox terms that have patterns of usage that can be
+   converted to mutable arrays without changing the external behaviour.
+
+   This procedure makes a few assumptions:
+   - Mutable arrays and immutable ones are supposed to be different types
+     (despite being the same on the lambdabox side). This is to enable backend to
+     compile them to different datastructures (from example to use differential
+     arrays for immutable ones).
+   - Whenever an array is passed to a function, or returned from one, we assume
+     it is an immutable one. This means the interface in unchanged compared to a
+     compilation without the mutable arrays.
+   - We make some assumption on the order of evaluation: we assume function
+     term and arguments are fully evaluated left to right before calling the
+     function, and that in a match the term matched is fully evaluated before any of
+     the branches.
+   - We force variables captured in lambdas or lazy blocks to be immutable
+     arrays, because we cannot control when/where it is going to be evaluated.
+
+   It proceeds in four steps:
+   - `import_term` convert a lambdabox term to a local term without making any
+     transformation.
+   - `parray_ops` inspects the term for anything that looks like primitive
+     array operations, and convert them into the allocate, read and mutate
+     constructors. The resulting term is invalid, since it always use mutable
+     operations, even when it would lead to a behaviour that is not consistent with
+     the initial term.
+   - `find_linear` enumerates every let binding, match nodes and allocation
+     nodes, and creates a union-find structure on them linking together nodes that
+     should have the same mutability status. It does so by pushing down information
+     about the expected mutability of the term, briging up information on if it can
+     be realised, and checking the linearity of the usage of variables. The
+     resulting union-find structure connect any enumerated node that must not be
+     linear to the 0 node.
+   - `extract_impl` uses the previous union-find structure to transfrom the
+     term into a valid one, by transforming mutable operations into immutable ones
+     when they happen in places that must produce immutable values.
+
+   Finally, the `optimize_arrays` connects all those operation to transfrom a
+   lambdabox term into a valid term with primitive array manipulation converted
+   into mutable operations where it is correct to do so. *)
+
 Declare Scope erasure.
 Local Open Scope erasure.
 
@@ -355,11 +399,6 @@ Definition connect_if_some uf (n : option nat) (m : nat) := match n with
 | Some n' => UF.connect uf n' m
 end.
 
-(* Lambda must not capture array variables, because we do not support marking lambda as linear *)
-(* We assume f a b c are evaluated left to right, and that the arguments are fully evaluated before calling f *)
-(* Assume the matched term in tCase is fully evaluated before any branch executes *)
-(* TODO what to do with primitives *)
-(* It must be unused in lazy term, because we cannot control when they are going to be evaluated *)
 Equations find_linear
   (* The natural is used to enumerate all bound variables, case and allocation
      within the term, starting from 1. Two locations are connected in the union-find
